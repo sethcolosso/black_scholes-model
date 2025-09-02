@@ -2,9 +2,7 @@ import numpy as np
 from scipy.stats import norm
 import matplotlib.pyplot as plt
 import qfin as qf
-
 plt.style.use('dark_background')  # Set global style
-
 # ===============================
 # Black-Scholes Pricing Function
 # ===============================
@@ -73,12 +71,11 @@ if market_ask > 0:
     print(f"Market Maker Quote: {option_price:.2f} @ {market_ask}")
     print(f"Trade Edge: {option_price - market_ask:.2f}")
 
-# ===============================
+# ==========================
 # Monte Carlo Simulation for Portfolio
-# ===============================
+# ===========================
 premium = (market_ask if market_ask > 0 else option_price) * 100
 pls = []
-
 print("\nRunning Monte Carlo simulation... This may take a few seconds.")
 for i in range(100):  # Adjust to 100000 if you want higher accuracy
     sim_path = qf.simulations.GeometricBrownianMotion(S, r, sigma, 1/252, 1)
@@ -87,7 +84,6 @@ for i in range(100):  # Adjust to 100000 if you want higher accuracy
         pls.append(max(final_sim_price - K, 0) * 100 - premium)
     else:
         pls.append(max(K - final_sim_price, 0) * 100 - premium)
-
 # Plot cumulative P/L over multiple trades
 plt.figure(figsize=(10, 5))
 plt.title("Trading This Edge Over Time")
