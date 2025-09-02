@@ -1,0 +1,98 @@
+import numpy as np
+from scipy.stats import norm
+import matplotlib.pyplot as plt
+import qfin as qf
+
+plt.style.use('dark_background')  # Set global style
+
+# ===============================
+# Black-Scholes Pricing Function
+# ===============================
+def black_scholes(S, K, sigma, r, t, option_type="call"):
+    """Calculates the Black-Scholes price for Call or Put options"""
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * t) / (sigma * np.sqrt(t))
+    d2 = d1 - sigma * np.sqrt(t)
+
+    if option_type.lower() == "call":
+        return S * norm.cdf(d1) - K * np.exp(-r * t) * norm.cdf(d2)
+    elif option_type.lower() == "put":
+        return K * np.exp(-r * t) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    else:
+        raise ValueError("Invalid option type! Choose 'call' or 'put'.")
+
+# ===============================
+# Get user inputs
+# ===============================
+print("\n=== European Option Analysis ===")
+option_type = input("Enter option type (call/put): ").strip().lower()
+S = float(input("Enter current stock price (S): "))
+K = float(input("Enter strike price (K): "))
+sigma = float(input("Enter volatility (σ in decimal, e.g. 0.3): "))
+r = float(input("Enter risk-free rate (r in decimal, e.g. 0.05): "))
+t = float(input("Enter time to maturity in years (t): "))
+market_ask = float(input("Enter market ask price (optional, default 0): ") or 0)
+
+# ===============================
+# Simulate a single price path
+# ===============================
+single_path = qf.simulations.GeometricBrownianMotion(S, r, sigma, 1/252, 1)
+
+# Plot single price path vs strike price
+plt.figure(figsize=(10, 5))
+plt.title("Terminal Value of an Option Contract")
+plt.hlines(K, 0, 252, label='Strike Price', color='orange')
+plt.plot(single_path.simulated_path, label='Simulated Price Path', color='white')
+final_price = single_path.simulated_path[-1]
+
+# Show profit/loss at expiry based on option type
+if option_type == "call":
+    payoff = max(final_price - K, 0)
+else:
+    payoff = max(K - final_price, 0)
+
+if payoff == 0:
+    plt.vlines(252, final_price, K, color='red', label="P/L")
+else:
+    plt.vlines(252, K, final_price, color='green', label="P/L")
+
+plt.xlabel('Time (Days)')
+plt.ylabel('Stock Price')
+plt.legend()
+plt.show()
+
+# ===============================
+# Option Pricing & P/L Calculation
+# ===============================
+option_price = black_scholes(S, K, sigma, r, t, option_type)
+print("\n=== Option Pricing Results ===")
+print(f"Black-Scholes {option_type.capitalize()} Price: {option_price:.2f}")
+print(f"Profit/Loss at expiry: {payoff - option_price:.2f}")
+
+# Market maker comparison
+if market_ask > 0:
+    print(f"Market Maker Quote: {option_price:.2f} @ {market_ask}")
+    print(f"Trade Edge: {option_price - market_ask:.2f}")
+
+# ===============================
+# Monte Carlo Simulation for Portfolio
+# ===============================
+premium = (market_ask if market_ask > 0 else option_price) * 100
+pls = []
+
+print("\nRunning Monte Carlo simulation... This may take a few seconds.")
+for i in range(100):  # Adjust to 100000 if you want higher accuracy
+    sim_path = qf.simulations.GeometricBrownianMotion(S, r, sigma, 1/252, 1)
+    final_sim_price = sim_path.simulated_path[-1]
+    if option_type == "call":
+        pls.append(max(final_sim_price - K, 0) * 100 - premium)
+    else:
+        pls.append(max(K - final_sim_price, 0) * 100 - premium)
+
+# Plot cumulative P/L over multiple trades
+plt.figure(figsize=(10, 5))
+plt.title("Trading This Edge Over Time")
+plt.plot(np.cumsum(pls), label="Account Equity", color="cyan")
+plt.xlabel('Option Trades')
+plt.ylabel('Portfolio Value')
+plt.legend()
+plt.show()
