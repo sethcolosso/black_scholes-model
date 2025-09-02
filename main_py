@@ -1,8 +1,12 @@
 import numpy as np
+import yfinance as yf
 from scipy.stats import norm
 import matplotlib.pyplot as plt
 import qfin as qf
+from datetime import datetime
+
 plt.style.use('dark_background')  # Set global style
+
 # ===============================
 # Black-Scholes Pricing Function
 # ===============================
@@ -19,30 +23,77 @@ def black_scholes(S, K, sigma, r, t, option_type="call"):
         raise ValueError("Invalid option type! Choose 'call' or 'put'.")
 
 # ===============================
-# Get user inputs
+# Get User Inputs
 # ===============================
-print("\n=== European Option Analysis ===")
+print("\n=== European Option Analysis (Auto-Fetch) ===")
+ticker = input("Enter stock symbol (e.g. AAPL): ").strip().upper()
 option_type = input("Enter option type (call/put): ").strip().lower()
-S = float(input("Enter current stock price (S): "))
-K = float(input("Enter strike price (K): "))
-sigma = float(input("Enter volatility (σ in decimal, e.g. 0.3): "))
-r = float(input("Enter risk-free rate (r in decimal, e.g. 0.05): "))
-t = float(input("Enter time to maturity in years (t): "))
+
+# Fetch data from Yahoo Finance
+data = yf.Ticker(ticker)
+
+# Get available expiration dates
+expirations = data.options
+if not expirations:
+    print(f"No option chain data available for {ticker}. Exiting...")
+    exit()
+
+print("\nAvailable Expiration Dates:")
+for i, date in enumerate(expirations):
+    print(f"[{i}] {date}")
+
+expiry_idx = int(input("\nSelect expiration date index: "))
+expiry = expirations[expiry_idx]
+
+# Get option chain for the selected expiration
+opt_chain = data.option_chain(expiry)
+options = opt_chain.calls if option_type == "call" else opt_chain.puts
+
+print("\nAvailable Strike Prices:")
+for i, strike in enumerate(options['strike'].tolist()):
+    print(f"[{i}] {strike}")
+
+strike_idx = int(input("\nSelect strike price index: "))
+K = options['strike'].iloc[strike_idx]
+
+# Get current price and historical data
+hist = data.history(period="1y")
+S = hist["Close"][-1]  # Current stock price
+
+# Calculate volatility from historical returns
+returns = np.log(hist["Close"] / hist["Close"].shift(1))
+sigma = np.std(returns) * np.sqrt(252)  # Annualized volatility
+
+# Risk-free rate (fixed)
+r = 0.05  
+
+# Time to maturity in years
+expiry_date = datetime.strptime(expiry, "%Y-%m-%d")
+today = datetime.today()
+t = (expiry_date - today).days / 365
+
+print(f"\nFetching data for {ticker}...")
+print(f"Current Price (S): {S:.2f}")
+print(f"Selected Expiry: {expiry}")
+print(f"Selected Strike Price (K): {K}")
+print(f"Estimated Volatility (σ): {sigma:.2f}")
+print(f"Time to Expiration (t): {t:.2f} years")
+print(f"Using Risk-Free Rate (r): {r:.2%}")
+
 market_ask = float(input("Enter market ask price (optional, default 0): ") or 0)
 
 # ===============================
-# Simulate a single price path
+# Simulate a Single Price Path
 # ===============================
 single_path = qf.simulations.GeometricBrownianMotion(S, r, sigma, 1/252, 1)
 
-# Plot single price path vs strike price
 plt.figure(figsize=(10, 5))
 plt.title("Terminal Value of an Option Contract")
 plt.hlines(K, 0, 252, label='Strike Price', color='orange')
 plt.plot(single_path.simulated_path, label='Simulated Price Path', color='white')
 final_price = single_path.simulated_path[-1]
 
-# Show profit/loss at expiry based on option type
+# Calculate payoff based on option type
 if option_type == "call":
     payoff = max(final_price - K, 0)
 else:
@@ -66,25 +117,26 @@ print("\n=== Option Pricing Results ===")
 print(f"Black-Scholes {option_type.capitalize()} Price: {option_price:.2f}")
 print(f"Profit/Loss at expiry: {payoff - option_price:.2f}")
 
-# Market maker comparison
 if market_ask > 0:
     print(f"Market Maker Quote: {option_price:.2f} @ {market_ask}")
     print(f"Trade Edge: {option_price - market_ask:.2f}")
 
-# ==========================
+# ===============================
 # Monte Carlo Simulation for Portfolio
-# ===========================
+# ===============================
 premium = (market_ask if market_ask > 0 else option_price) * 100
 pls = []
+
 print("\nRunning Monte Carlo simulation... This may take a few seconds.")
-for i in range(100):  # Adjust to 100000 if you want higher accuracy
+for i in range(1000):  # Adjustable for speed vs accuracy
     sim_path = qf.simulations.GeometricBrownianMotion(S, r, sigma, 1/252, 1)
     final_sim_price = sim_path.simulated_path[-1]
     if option_type == "call":
         pls.append(max(final_sim_price - K, 0) * 100 - premium)
     else:
         pls.append(max(K - final_sim_price, 0) * 100 - premium)
-# Plot cumulative P/L over multiple trades
+
+# Plot cumulative P/L
 plt.figure(figsize=(10, 5))
 plt.title("Trading This Edge Over Time")
 plt.plot(np.cumsum(pls), label="Account Equity", color="cyan")
