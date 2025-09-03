@@ -1,0 +1,458 @@
+
+import numpy as np
+import yfinance as yf
+from scipy.stats import norm
+import matplotlib.pyplot as plt
+import pandas as pd
+from datetime import datetime
+
+# optional: keep qfin reference if you use it elsewhere; script works without it for simulations
+try:
+    import qfin as qf
+    _HAS_QFIN = True
+except Exception:
+    _HAS_QFIN = False
+
+plt.style.use('dark_background')
+
+# -----------------------
+# Helper functions
+# -----------------------
+def safe_market_price(row: pd.Series):
+    """Robust fallback for option market price"""
+    try:
+        ask = float(row.get('ask', np.nan))
+    except:
+        ask = np.nan
+    try:
+        bid = float(row.get('bid', np.nan))
+    except:
+        bid = np.nan
+    try:
+        last = float(row.get('lastPrice', np.nan))
+    except:
+        last = np.nan
+
+    if np.isfinite(ask) and ask > 0:
+        return ask
+    if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0:
+        return 0.5 * (bid + ask)
+    if np.isfinite(last) and last > 0:
+        return last
+    return np.nan
+
+def fetch_risk_free_rate():
+    """Get 10Y treasury yield from Yahoo (as decimal); fallback to 5%"""
+    try:
+        tnx = yf.Ticker("^TNX")
+        r = tnx.history(period="5d")["Close"].dropna().iloc[-1] / 100.0
+        print(f"Using Real-Time Risk-Free Rate (10Y Treasury): {r:.2%}")
+        return float(r)
+    except Exception:
+        print("⚠️ Could not fetch risk-free rate, defaulting to 5%.")
+        return 0.05
+
+def annualized_hist_vol(prices: pd.Series):
+    """Annualized historical volatility from log returns (252 trading days)"""
+    rets = np.log(prices / prices.shift(1)).dropna()
+    return float(np.std(rets) * np.sqrt(252))
+
+def time_to_maturity_years(expiry_str: str):
+    expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d")
+    today = datetime.today()
+    days = max((expiry_date - today).days, 0)
+    return days / 365.0, expiry_date, days
+
+def black_scholes_price_and_greeks(S, K, sigma, r, t, option_type="call"):
+    """
+    Returns: price, delta, gamma, vega, theta
+    Price in $ per share. Greeks per 1 share (not per contract).
+    Theta approximated per year.
+    """
+    # handle degenerate / immediate expiry
+    if t <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        price = max(S - K, 0.0) if option_type == "call" else max(K - S, 0.0)
+        return price, 1.0 if (option_type=="call" and S > K) else 0.0, 0.0, 0.0, 0.0
+
+    sqrt_t = np.sqrt(t)
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+
+    if option_type.lower() == "call":
+        price = S * norm.cdf(d1) - K * np.exp(-r * t) * norm.cdf(d2)
+        delta = norm.cdf(d1)
+    else:
+        price = K * np.exp(-r * t) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        delta = -norm.cdf(-d1)  # equals norm.cdf(d1) - 1
+
+    gamma = norm.pdf(d1) / (S * sigma * sqrt_t)
+    vega = S * norm.pdf(d1) * sqrt_t  # per 1 vol (i.e. 0.01 -> *vega* * 0.01)
+    # theta per year (approx), negative is decay
+    if option_type.lower() == "call":
+        theta = (-S * norm.pdf(d1) * sigma) / (2 * sqrt_t) - r * K * np.exp(-r * t) * norm.cdf(d2)
+    else:
+        theta = (-S * norm.pdf(d1) * sigma) / (2 * sqrt_t) + r * K * np.exp(-r * t) * norm.cdf(-d2)
+
+    return price, delta, gamma, vega, theta
+
+# NumPy GBM simulator (single path)
+def gbm_single_path(S0, r, sigma, days):
+    if days <= 0:
+        return np.array([S0])
+    dt = 1.0/252.0
+    n_steps = int(days)
+    path = np.empty(n_steps + 1)
+    path[0] = S0
+    for i in range(1, n_steps+1):
+        z = np.random.standard_normal()
+        path[i] = path[i-1] * np.exp((r - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * z)
+    return path
+
+# NumPy Monte Carlo GBM (vectorized)
+def gbm_monte_carlo(S0, r, sigma, days, n_sims=1000):
+    if days <= 0:
+        return np.full((1, n_sims), S0)
+    dt = 1.0/252.0
+    n_steps = int(days)
+    Z = np.random.standard_normal((n_steps, n_sims))
+    increments = (r - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * Z
+    log_paths = np.vstack([np.zeros(n_sims), np.cumsum(increments, axis=0)])
+    paths = S0 * np.exp(log_paths)
+    return paths  # shape (n_steps+1, n_sims)
+
+# RSI (14) calculation
+def calc_rsi(series: pd.Series, period=14):
+    delta = series.diff()
+    up = delta.where(delta > 0, 0.0)
+    down = -delta.where(delta < 0, 0.0)
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / ma_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# ------------------------------
+# Main flow (preserve existing features)
+# ------------------------------
+print("\n=== Upgraded Options Edge Finder (Implied Vol + Greeks + Dual Analysis) ===")
+ticker = input("Enter stock symbol (e.g. AAPL): ").strip().upper()
+yt = yf.Ticker(ticker)
+
+# get expirations and require selection by number
+expirations = yt.options
+if not expirations:
+    print(f"No option chain data available for {ticker}. Exiting...")
+    raise SystemExit
+
+print("\nAvailable Expiration Dates:")
+for i, d in enumerate(expirations):
+    print(f"[{i}] {d}")
+
+expiry_idx = int(input("\nChoose expiration by number (e.g. 0 for nearest): ").strip())
+if expiry_idx < 0 or expiry_idx >= len(expirations):
+    print("Invalid choice. Exiting...")
+    raise SystemExit
+expiry = expirations[expiry_idx]
+
+# historical data & inputs
+hist = yt.history(period="1y")
+if hist.empty:
+    hist = yt.history(period="2y")
+    if hist.empty:
+        print("No historical data found. Exiting...")
+        raise SystemExit
+
+S = float(hist["Close"].iloc[-1])
+sigma_hist = annualized_hist_vol(hist["Close"])
+r = fetch_risk_free_rate()
+t_years, expiry_date, days_to_expiry = time_to_maturity_years(expiry)
+if t_years == 0:
+    print("⚠️ Expiry is today or in the past; results may be trivial.")
+
+# RSI signal
+rsi_series = calc_rsi(hist["Close"], period=14)
+latest_rsi = rsi_series.dropna().iloc[-1] if not rsi_series.dropna().empty else None
+if latest_rsi is not None:
+    rsi_status = "Overbought" if latest_rsi > 70 else ("Oversold" if latest_rsi < 30 else "Neutral")
+else:
+    rsi_status = "N/A"
+
+# option chain and ATM selection
+chain = yt.option_chain(expiry)
+calls = chain.calls.copy()
+puts = chain.puts.copy()
+
+def closest_row_by_strike(df: pd.DataFrame, spot: float):
+    if df.empty:
+        return None
+    idx = (df['strike'] - spot).abs().argsort().iloc[0]
+    return df.iloc[idx]
+
+call_row = closest_row_by_strike(calls, S)
+put_row = closest_row_by_strike(puts, S)
+
+if call_row is None and put_row is None:
+    print("No contracts found for that expiry. Exiting...")
+    raise SystemExit
+
+# Fetch market prices and implied vol if available
+def extract_option_info(row):
+    if row is None:
+        return dict(strike=np.nan, market=np.nan, iv=np.nan, last=np.nan)
+    strike = float(row['strike'])
+    market = safe_market_price(row)
+    iv = row.get('impliedVolatility', np.nan)
+    # yfinance sometimes gives IV as fraction (e.g. 0.25) or NaN
+    try:
+        iv = float(iv) if np.isfinite(iv) else np.nan
+    except:
+        iv = np.nan
+    last = float(row.get('lastPrice', np.nan))
+    bid = float(row.get('bid', np.nan)) if 'bid' in row.index else np.nan
+    ask = float(row.get('ask', np.nan)) if 'ask' in row.index else np.nan
+    return dict(strike=strike, market=market, iv=iv, last=last, bid=bid, ask=ask)
+
+call_info = extract_option_info(call_row)
+put_info = extract_option_info(put_row)
+
+# If implied vol exists, use it; otherwise fallback to hist vol for BS pricing
+call_iv = call_info['iv'] if np.isfinite(call_info['iv']) and call_info['iv'] > 0 else sigma_hist
+put_iv = put_info['iv'] if np.isfinite(put_info['iv']) and put_info['iv'] > 0 else sigma_hist
+
+# Compute BS price + Greeks for both sides using HIST vol (to get an independent theoretical price)
+call_bs_hist, call_delta_hist, call_gamma_hist, call_vega_hist, call_theta_hist = \
+    black_scholes_price_and_greeks(S, call_info['strike'], sigma_hist, r, t_years, "call") if np.isfinite(call_info['strike']) else (np.nan,)*5
+
+put_bs_hist, put_delta_hist, put_gamma_hist, put_vega_hist, put_theta_hist = \
+    black_scholes_price_and_greeks(S, put_info['strike'], sigma_hist, r, t_years, "put") if np.isfinite(put_info['strike']) else (np.nan,)*5
+
+# Also compute BS price using IMPLIED vol (if available) — this is what market is effectively pricing
+call_bs_iv, _, _, _, _ = black_scholes_price_and_greeks(S, call_info['strike'], call_iv, r, t_years, "call") if np.isfinite(call_info['strike']) else (np.nan,)*5
+put_bs_iv, _, _, _, _ = black_scholes_price_and_greeks(S, put_info['strike'], put_iv, r, t_years, "put") if np.isfinite(put_info['strike']) else (np.nan,)*5
+
+# Edges: price edge relative to market using HIST-vol theoretical
+call_edge_price = (call_bs_hist - call_info['market']) if np.isfinite(call_info['market']) else np.nan
+put_edge_price  = (put_bs_hist  - put_info['market'])  if np.isfinite(put_info['market'])  else np.nan
+
+# IV gap metric
+call_iv_gap = call_info['iv'] - sigma_hist if np.isfinite(call_info['iv']) else np.nan
+put_iv_gap  = put_info['iv']  - sigma_hist if np.isfinite(put_info['iv'])  else np.nan
+
+# -------------------------
+# Print summary (expanded)
+# -------------------------
+print("\n=== Inputs (Auto-Fetched) ===")
+print(f"Ticker: {ticker}")
+print(f"Spot (S): {S:.4f}")
+print(f"Expiry: {expiry}  (t = {t_years:.4f} years | {days_to_expiry} days)")
+print(f"Hist Vol (σ_hist): {sigma_hist:.2%}")
+print(f"Risk-free (r): {r:.2%}")
+print(f"RSI (14): {latest_rsi:.2f} -> {rsi_status}")
+
+print("\n=== ATM Contract Selection & Pricing ===")
+if np.isfinite(call_info['strike']):
+    print(f"[CALL] Strike: {call_info['strike']:.2f} | Market: {call_info['market']} | IV: {call_info['iv']} | BS(histσ): {call_bs_hist:.4f} | BS(iv): {call_bs_iv:.4f} | Edge(histσ - Mkt): {call_edge_price:.4f} | IV gap (iv - hist): {call_iv_gap:.4f}")
+if np.isfinite(put_info['strike']):
+    print(f"[PUT ] Strike: {put_info['strike']:.2f} | Market: {put_info['market']} | IV: {put_info['iv']} | BS(histσ): {put_bs_hist:.4f} | BS(iv): {put_bs_iv:.4f} | Edge(histσ - Mkt): {put_edge_price:.4f} | IV gap (iv - hist): {put_iv_gap:.4f}")
+
+# show Greeks based on HIST vol (to reflect model sensitivities)
+print("\n=== Greeks (based on historical vol model) ===")
+if np.isfinite(call_info['strike']):
+    print(f"[CALL] Delta: {call_delta_hist:.4f} | Gamma: {call_gamma_hist:.6f} | Vega: {call_vega_hist:.4f} | Theta (yr): {call_theta_hist:.4f}")
+if np.isfinite(put_info['strike']):
+    print(f"[PUT ] Delta: {put_delta_hist:.4f} | Gamma: {put_gamma_hist:.6f} | Vega: {put_vega_hist:.4f} | Theta (yr): {put_theta_hist:.4f}")
+
+# -------------------------
+# Choose best edge (by price edge using HIST-vol)
+# -------------------------
+edges = []
+if np.isfinite(call_edge_price):
+    edges.append(("call", call_edge_price, call_info['strike'], call_info['market'], call_bs_hist, call_info['iv']))
+if np.isfinite(put_edge_price):
+    edges.append(("put", put_edge_price, put_info['strike'], put_info['market'], put_bs_hist, put_info['iv']))
+
+if not edges:
+    print("\nNo valid market prices to compute edge. Exiting...")
+    raise SystemExit
+
+edges_sorted = sorted(edges, key=lambda x: x[1], reverse=True)
+best_type, best_edge, best_K, best_mkt, best_bs, best_iv = edges_sorted[0]
+
+print("\n=== Recommendation ===")
+if best_edge > 0:
+    print(f"» Best edge: {best_type.upper()} (Strike {best_K:.2f}) with edge {best_edge:.4f} per share (BS_hist {best_bs:.4f} vs Market {best_mkt:.4f}). Consider BUY (model undervalues vs market).")
+else:
+    print(f"» Best edge: {best_type.upper()} (Strike {best_K:.2f}) edge {best_edge:.4f} — model indicates avoid buying.")
+
+# Deposit & expected return/loss (model-based)
+deposit_per_contract = best_mkt * 100.0 if np.isfinite(best_mkt) else np.nan
+# expected returns using our model: (BS_hist - market) * 100 per contract (simple)
+expected_return_per_contract = best_bs - best_mkt if np.isfinite(best_bs) and np.isfinite(best_mkt) else np.nan
+expected_return_per_contract_dollars = expected_return_per_contract * 100 if np.isfinite(expected_return_per_contract) else np.nan
+
+print(f"\nMinimum deposit to buy 1 contract (market premium*100): ${deposit_per_contract:.2f}")
+print(f"Model expected return per contract (BS_hist - market) * 100: ${expected_return_per_contract_dollars:.2f}")
+
+# ------------------------------
+# Visualization & Monte Carlo (preserve original graphs and add MC using numpy)
+# ------------------------------
+
+# Single path: use qfin if available as original did, else use numpy GBM but keep plotting style similar
+if _HAS_QFIN:
+    try:
+        single_q = qf.simulations.GeometricBrownianMotion(S, r, sigma_hist, 1.0/252.0, days_to_expiry)
+        single_path = np.array(single_q.simulated_path)
+    except Exception:
+        single_path = gbm_single_path(S, r, sigma_hist, days_to_expiry)
+else:
+    single_path = gbm_single_path(S, r, sigma_hist, days_to_expiry)
+
+final_price = float(single_path[-1])
+
+plt.figure(figsize=(10,5))
+plt.title(f"Simulated Price Path to Expiry ({ticker})")
+# keep strike line across the whole x-range (use days_to_expiry as endpoint)
+h_end = max(1, days_to_expiry)
+plt.hlines(best_K, 0, h_end, label=f'Strike {best_K:.2f}', color='orange')
+# ensure we plot up to h_end points (pad if necessary to mimic original 252 style)
+x = np.arange(0, h_end+1)
+if len(single_path) < len(x):
+    arr = np.pad(single_path, (0, len(x)-len(single_path)), 'edge')
+else:
+    arr = single_path[:len(x)]
+plt.plot(x, arr, label='Simulated Price Path', color='white')
+
+# payoff bar at expiry (color-coded)
+if best_type == "call":
+    payoff = max(final_price - best_K, 0)
+else:
+    payoff = max(best_K - final_price, 0)
+
+if payoff == 0:
+    plt.vlines(h_end, final_price, best_K, color='red', label="P/L")
+else:
+    lo, hi = (best_K, final_price) if best_type == "call" else (final_price, best_K)
+    plt.vlines(h_end, lo, hi, color='green', label="P/L")
+
+plt.xlabel('Time (Days)')
+plt.ylabel('Stock Price')
+plt.legend()
+plt.show()
+
+# Monte Carlo: use NumPy vectorized GBM
+if np.isfinite(best_mkt) and best_mkt > 0:
+    premium = best_mkt * 100.0
+    n_mc = 1000
+    print("\nRunning Monte Carlo simulation for best side... (1,000 paths)")
+    mc_paths = gbm_monte_carlo(S, r, sigma_hist, max(1, days_to_expiry), n_sims=n_mc)
+    final_vals = mc_paths[-1, :]
+    if best_type == "call":
+        pls = np.maximum(final_vals - best_K, 0.0) * 100.0 - premium
+    else:
+        pls = np.maximum(best_K - final_vals, 0.0) * 100.0 - premium
+
+    # Trading Edge Over Time (cumulative P/L sampling)
+    plt.figure(figsize=(10,5))
+    plt.title(f"Trading Edge Over Time — {best_type.upper()} ATM @ {expiry}")
+    plt.plot(np.cumsum(pls), label="Account Equity", color="cyan")
+    plt.xlabel('Option Trades')
+    plt.ylabel('Portfolio Value')
+    plt.legend()
+    plt.show()
+
+    # Monte Carlo stats
+    expected_value = float(np.mean(pls))
+    prob_profit = float(np.mean(pls > 0))
+    avg_gain_if_win = float(np.mean(pls[pls > 0])) if np.any(pls > 0) else 0.0
+    avg_loss_if_loss = float(np.mean(pls[pls <= 0])) if np.any(pls <= 0) else 0.0
+
+    print("\n=== Monte Carlo Insights ===")
+    print(f"Expected P/L per trade (avg): ${expected_value:.2f}")
+    print(f"Probability of profit per trade: {prob_profit:.2%}")
+    print(f"Average gain when profitable: ${avg_gain_if_win:.2f}")
+    print(f"Average loss when losing: ${avg_loss_if_loss:.2f}")
+
+else:
+    print("\nNo valid market ask price for Monte Carlo P/L (best side). Skipping MC plot and stats.")
+
+# ------------------------------
+# Risk management & deposit list & enhanced Risk vs Reward
+# ------------------------------
+if np.isfinite(best_mkt) and best_mkt > 0:
+    contracts = int(input("\nHow many option contracts do you want to trade? (Default 1): ") or 1)
+    min_deposit = best_mkt * contracts * 100.0
+    print(f"\n=== Risk Management ===")
+    print(f"Option Type: {best_type.upper()}")
+    print(f"Contracts chosen: {contracts}")
+    print(f"Premium (market) per contract: ${best_mkt:.2f}")
+    print(f"Minimum Deposit Required (to buy now): ${min_deposit:.2f}")
+
+    # Deposit list for 1..N
+    max_show = min(10, 50)
+    deposits = [(n, best_mkt * n * 100.0) for n in range(1, max_show+1)]
+    print("\nDeposit list (contracts -> required capital):")
+    for n, dep in deposits:
+        print(f"{n} contract(s): ${dep:.2f}")
+
+    # Risk vs Reward curve (detailed)
+    prices = np.linspace(S * 0.4, S * 1.6, 500)
+    if best_type == "call":
+        payoff = np.maximum(prices - best_K, 0.0) * contracts * 100.0 - best_mkt * contracts * 100.0
+    else:
+        payoff = np.maximum(best_K - prices, 0.0) * contracts * 100.0 - best_mkt * contracts * 100.0
+
+    # Monte Carlo payoff distribution for chosen contracts
+    if 'final_vals' in locals():
+        if best_type == 'call':
+            payoffs_mc = np.maximum(final_vals - best_K, 0.0) * 100.0 * contracts - best_mkt * 100.0 * contracts
+        else:
+            payoffs_mc = np.maximum(best_K - final_vals, 0.0) * 100.0 * contracts - best_mkt * 100.0 * contracts
+        mc_mean = np.mean(payoffs_mc)
+        mc_median = np.median(payoffs_mc)
+        mc_p5 = np.percentile(payoffs_mc, 5)
+        mc_p95 = np.percentile(payoffs_mc, 95)
+    else:
+        payoffs_mc = None
+        mc_mean = mc_median = mc_p5 = mc_p95 = None
+
+    plt.figure(figsize=(12,6))
+    plt.plot(prices, payoff, color='cyan', linewidth=2, label='Deterministic payoff at expiry (range)')
+    # annotate breakeven and strike
+    if best_type == 'call':
+        breakeven = best_K + best_mkt
+    else:
+        breakeven = best_K - best_mkt
+
+    plt.axvline(best_K, color='orange', linestyle='--', label=f'Strike {best_K:.2f}')
+    plt.axvline(breakeven, color='green', linestyle='--', label=f'Breakeven {breakeven:.2f}')
+    plt.axhline(0, color='white', linestyle='--')
+
+    # overlay MC percentiles as vertical price markers
+    if payoffs_mc is not None:
+        pv = np.percentile(final_vals, [5, 50, 95])
+        plt.axvline(pv[0], color='gray', linestyle=':', label='5% final price')
+        plt.axvline(pv[1], color='white', linestyle='-.', label='Median final price')
+        plt.axvline(pv[2], color='gray', linestyle=':', label='95% final price')
+
+        # annotate MC P/L stats
+        plt.annotate(f"MC mean P/L: ${mc_mean:.2f}", xy=(0.02, 0.92), xycoords='axes fraction', color='yellow')
+        plt.annotate(f"MC median P/L: ${mc_median:.2f}", xy=(0.02, 0.88), xycoords='axes fraction', color='yellow')
+        plt.annotate(f"MC 5% / 95% P/L: ${mc_p5:.2f} / ${mc_p95:.2f}", xy=(0.02, 0.84), xycoords='axes fraction', color='yellow')
+
+    plt.title("Risk vs Reward Profile (Detailed)")
+    plt.xlabel("Underlying Price at Expiry")
+    plt.ylabel("Profit / Loss ($)")
+    plt.legend()
+    plt.grid(alpha=0.2)
+    plt.show()
+
+else:
+    print("\n⚠️ Cannot calculate deposit & risk management — missing market price.")
+
+# ------------------------------
+# Final RSI print
+# ------------------------------
+if latest_rsi is not None:
+    print(f"\nLatest 14-day RSI: {latest_rsi:.2f} ({rsi_status})")
+else:
+    print("\nCould not compute RSI due to insufficient data.")
