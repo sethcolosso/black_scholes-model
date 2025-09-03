@@ -4,30 +4,74 @@ from scipy.stats import norm
 import matplotlib.pyplot as plt
 import qfin as qf
 from datetime import datetime
-import requests
+import pandas as pd
 
 plt.style.use('dark_background')  # Set global style
 
 # ===============================
-# Fetch Real-Time Risk-Free Rate
+# Helpers
 # ===============================
+def safe_market_price(row: pd.Series):
+    """
+    Get a usable 'market price' for an option row with robust fallbacks:
+    1) ask if positive
+    2) mid = (bid+ask)/2 if both positive
+    3) lastPrice if positive
+    4) else NaN
+    """
+    ask = float(row.get('ask', np.nan))
+    bid = float(row.get('bid', np.nan))
+    last = float(row.get('lastPrice', np.nan))
+
+    if np.isfinite(ask) and ask > 0:
+        return ask
+    if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0:
+        return 0.5 * (bid + ask)
+    if np.isfinite(last) and last > 0:
+        return last
+    return np.nan
+
 def fetch_risk_free_rate():
-    """Fetches the current 10-Year Treasury Yield from Yahoo Finance"""
+    """
+    Fetch current 10Y Treasury Yield from Yahoo Finance (^TNX) and convert to decimal.
+    Falls back to 5% if anything fails.
+    """
     try:
-        tnx = yf.Ticker("^TNX")  # 10-Year Treasury Yield
-        r = tnx.history(period="1d")["Close"].iloc[-1] / 100  # Convert % to decimal
+        tnx = yf.Ticker("^TNX")
+        r = tnx.history(period="5d")["Close"].dropna().iloc[-1] / 100.0
         print(f"Using Real-Time Risk-Free Rate (10Y Treasury): {r:.2%}")
-        return r
-    except Exception as e:
+        return float(r)
+    except Exception:
         print("⚠️ Could not fetch risk-free rate, defaulting to 5%.")
         return 0.05
 
+def annualized_hist_vol(prices: pd.Series):
+    """Log-return annualized volatility (252 trading days)."""
+    rets = np.log(prices / prices.shift(1)).dropna()
+    return float(np.std(rets) * np.sqrt(252))
+
+def time_to_maturity_years(expiry_str: str):
+    expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d")
+    today = datetime.today()
+    days = (expiry_date - today).days
+    return max(days, 0) / 365.0, expiry_date
+
 # ===============================
-# Black-Scholes Pricing Function
+# Black-Scholes Pricing
 # ===============================
 def black_scholes(S, K, sigma, r, t, option_type="call"):
-    """Calculates the Black-Scholes price for Call or Put options"""
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * t) / (sigma * np.sqrt(t))
+    """
+    Theoretical price for European call/put under Black-Scholes.
+    S: spot, K: strike, sigma: vol, r: risk-free (cont.), t: years
+    """
+    if t <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        # Degenerate/expiry cases: price ~ intrinsic discounted appropriately
+        if option_type == "call":
+            return max(S - K, 0.0)
+        else:
+            return max(K - S, 0.0)
+
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * t) / (sigma * np.sqrt(t))
     d2 = d1 - sigma * np.sqrt(t)
 
     if option_type.lower() == "call":
@@ -35,122 +79,171 @@ def black_scholes(S, K, sigma, r, t, option_type="call"):
     elif option_type.lower() == "put":
         return K * np.exp(-r * t) * norm.cdf(-d2) - S * norm.cdf(-d1)
     else:
-        raise ValueError("Invalid option type! Choose 'call' or 'put'.")
+        raise ValueError("option_type must be 'call' or 'put'")
 
 # ===============================
-# Main Program
+# Core flow
 # ===============================
-print("\n=== Automated European Option Analysis ===")
+print("\n=== Automated Options Edge Finder (Both Calls & Puts) ===")
 ticker = input("Enter stock symbol (e.g. AAPL): ").strip().upper()
-option_type = input("Enter option type (call/put): ").strip().lower()
 
-# Fetch data from Yahoo Finance
-data = yf.Ticker(ticker)
+yt = yf.Ticker(ticker)
 
-# Get nearest expiration automatically
-expirations = data.options
+# 1) List expirations and let user choose
+expirations = yt.options
 if not expirations:
     print(f"No option chain data available for {ticker}. Exiting...")
-    exit()
-expiry = expirations[0]
+    raise SystemExit
 
-# Get option chain and auto-select closest strike
-opt_chain = data.option_chain(expiry)
-options = opt_chain.calls if option_type == "call" else opt_chain.puts
+print("\nAvailable Expiration Dates:")
+for i, date in enumerate(expirations):
+    print(f"[{i}] {date}")
 
-# Current price
-hist = data.history(period="1y")
-S = hist["Close"][-1]
+expiry_input = input("\nType the expiration date exactly as shown (e.g. 2025-01-17), or press Enter to pick the nearest: ").strip()
+expiry = expiry_input if expiry_input else expirations[0]
 
-# Closest strike
-closest_row = options.iloc[(options['strike'] - S).abs().argsort()].iloc[0]
-K = closest_row['strike']
+# 2) Market data: spot & hist vol
+hist = yt.history(period="1y")
+if hist.empty:
+    print("No historical data found. Exiting...")
+    raise SystemExit
 
-# Automatically fetch the ask price for that strike
-market_ask = closest_row['ask'] if closest_row['ask'] > 0 else closest_row['lastPrice']
-
-# Calculate volatility from historical returns
-returns = np.log(hist["Close"] / hist["Close"].shift(1))
-sigma = np.std(returns) * np.sqrt(252)
-
-# Fetch real-time risk-free rate
+S = float(hist["Close"].iloc[-1])
+sigma = annualized_hist_vol(hist["Close"])
 r = fetch_risk_free_rate()
+t, expiry_date = time_to_maturity_years(expiry)
+if t == 0:
+    print("⚠️ Expiry is today or in the past; results may be trivial.")
 
-# Time to maturity in years
-expiry_date = datetime.strptime(expiry, "%Y-%m-%d")
-today = datetime.today()
-t = (expiry_date - today).days / 365
+# 3) Pull chain for chosen expiry; pick ATM strike for BOTH calls and puts
+chain = yt.option_chain(expiry)
+calls = chain.calls.copy()
+puts = chain.puts.copy()
+
+# find ATM strike for calls and puts separately (could differ slightly if contract lists differ)
+def closest_row_by_strike(df: pd.DataFrame, spot: float):
+    if df.empty:
+        return None
+    idx = (df['strike'] - spot).abs().argsort().iloc[0]
+    return df.iloc[idx]
+
+call_row = closest_row_by_strike(calls, S)
+put_row  = closest_row_by_strike(puts, S)
+
+if call_row is None and put_row is None:
+    print("No contracts found for that expiry. Exiting...")
+    raise SystemExit
+
+# 4) Get market prices with robust fallback
+call_K = float(call_row['strike']) if call_row is not None else np.nan
+put_K  = float(put_row['strike'])  if put_row  is not None else np.nan
+
+call_mkt = safe_market_price(call_row) if call_row is not None else np.nan
+put_mkt  = safe_market_price(put_row)  if put_row  is not None else np.nan
+
+# 5) Black-Scholes fair values
+call_bs = black_scholes(S, call_K, sigma, r, t, "call") if np.isfinite(call_K) else np.nan
+put_bs  = black_scholes(S, put_K,  sigma, r, t, "put")  if np.isfinite(put_K)  else np.nan
+
+# 6) Trade edges (positive = model thinks it’s cheap)
+call_edge = (call_bs - call_mkt) if np.isfinite(call_mkt) else np.nan
+put_edge  = (put_bs  - put_mkt)  if np.isfinite(put_mkt)  else np.nan
 
 # ===============================
-# Display Selected Parameters
+# Summary print
 # ===============================
-print(f"\nFetching data for {ticker}...")
-print(f"Current Price (S): {S:.2f}")
-print(f"Nearest Expiry: {expiry}")
-print(f"Closest Strike Price (K): {K}")
-print(f"Market Ask Price: {market_ask:.2f}")
-print(f"Estimated Volatility (σ): {sigma:.2f}")
-print(f"Time to Expiration (t): {t:.2f} years")
+print("\n=== Inputs (Auto-Fetched) ===")
+print(f"Ticker: {ticker}")
+print(f"Spot (S): {S:.4f}")
+print(f"Expiry: {expiry}  (t = {t:.4f} years)")
+print(f"Hist Vol (σ): {sigma:.2%}")
+print(f"Risk-free (r): {r:.2%}")
+
+print("\n=== ATM Contract Selection & Pricing ===")
+if np.isfinite(call_K):
+    print(f"[CALL] Strike: {call_K:.2f} | Market: {call_mkt if np.isfinite(call_mkt) else 'N/A'} | BS: {call_bs:.4f} | Edge: {call_edge if np.isfinite(call_edge) else 'N/A'}")
+else:
+    print("[CALL] No suitable contract found.")
+
+if np.isfinite(put_K):
+    print(f"[PUT ] Strike: {put_K:.2f} | Market: {put_mkt if np.isfinite(put_mkt) else 'N/A'} | BS: {put_bs:.4f} | Edge: {put_edge if np.isfinite(put_edge) else 'N/A'}")
+else:
+    print("[PUT ] No suitable contract found.")
+
+# 7) Choose best edge (greater is better for buyer)
+edges = []
+if np.isfinite(call_edge):
+    edges.append(("call", call_edge, call_K, call_mkt, call_bs))
+if np.isfinite(put_edge):
+    edges.append(("put",  put_edge,  put_K,  put_mkt,  put_bs))
+
+if not edges:
+    print("\nNo valid market prices to compute edge. Exiting...")
+    raise SystemExit
+
+edges_sorted = sorted(edges, key=lambda x: x[1], reverse=True)
+best_type, best_edge, best_K, best_mkt, best_bs = edges_sorted[0]
+
+print("\n=== Recommendation ===")
+if best_edge > 0:
+    print(f"» Best edge: {best_type.upper()} (Strike {best_K:.2f}) with edge {best_edge:.4f} per share "
+          f"(BS {best_bs:.4f} vs Market {best_mkt:.4f}). Consider BUY (undervalued).")
+else:
+    print(f"» Best edge: {best_type.upper()} (Strike {best_K:.2f}) but edge is {best_edge:.4f} per share "
+          f"(BS {best_bs:.4f} vs Market {best_mkt:.4f}). Likely OVERPRICED — avoid buying.")
 
 # ===============================
-# Simulate a Single Price Path
+# Visualization & Monte Carlo for the best side
 # ===============================
+# Single GBM path
 single_path = qf.simulations.GeometricBrownianMotion(S, r, sigma, 1/252, 1)
+final_price = float(single_path.simulated_path[-1])
 
 plt.figure(figsize=(10, 5))
-plt.title("Terminal Value of an Option Contract")
-plt.hlines(K, 0, 252, label='Strike Price', color='orange')
+plt.title(f"Simulated Price Path to Expiry ({ticker})")
+plt.hlines(best_K, 0, 252, label=f'Strike {best_K:.2f}', color='orange')
 plt.plot(single_path.simulated_path, label='Simulated Price Path', color='white')
-final_price = single_path.simulated_path[-1]
 
-# Calculate payoff
-if option_type == "call":
-    payoff = max(final_price - K, 0)
+# payoff for best side
+if best_type == "call":
+    payoff = max(final_price - best_K, 0)
 else:
-    payoff = max(K - final_price, 0)
+    payoff = max(best_K - final_price, 0)
 
-# Color-coded payoff visualization
+# color P/L bar
 if payoff == 0:
-    plt.vlines(252, final_price, K, color='red', label="P/L")
+    plt.vlines(252, final_price, best_K, color='red', label="P/L")
 else:
-    plt.vlines(252, K, final_price, color='green', label="P/L")
+    lo, hi = (best_K, final_price) if best_type == "call" else (final_price, best_K)
+    plt.vlines(252, lo, hi, color='green', label="P/L")
 
 plt.xlabel('Time (Days)')
 plt.ylabel('Stock Price')
 plt.legend()
 plt.show()
 
-# ===============================
-# Option Pricing & P/L Calculation
-# ===============================
-option_price = black_scholes(S, K, sigma, r, t, option_type)
-print("\n=== Option Pricing Results ===")
-print(f"Black-Scholes {option_type.capitalize()} Price: {option_price:.2f}")
-print(f"Profit/Loss at expiry: {payoff - option_price:.2f}")
-print(f"Trade Edge: {option_price - market_ask:.2f}")
+# Monte Carlo (uses market ask as cost basis since that’s executable)
+if np.isfinite(best_mkt) and best_mkt > 0:
+    premium = best_mkt * 100.0
+    pls = []
 
-# ===============================
-# Monte Carlo Simulation for Portfolio
-# ===============================
-premium = market_ask * 100
-pls = []
+    print("\nRunning Monte Carlo simulation for best side... (1,000 paths)")
+    for _ in range(1000):
+        sim = qf.simulations.GeometricBrownianMotion(S, r, sigma, 1/252, 1)
+        ST = float(sim.simulated_path[-1])
+        if best_type == "call":
+            pls.append(max(ST - best_K, 0) * 100.0 - premium)
+        else:
+            pls.append(max(best_K - ST, 0) * 100.0 - premium)
 
-print("\nRunning Monte Carlo simulation... This may take a few seconds.")
-for i in range(1000):
-    sim_path = qf.simulations.GeometricBrownianMotion(S, r, sigma, 1/252, 1)
-    final_sim_price = sim_path.simulated_path[-1]
-    if option_type == "call":
-        pls.append(max(final_sim_price - K, 0) * 100 - premium)
-    else:
-        pls.append(max(K - final_sim_price, 0) * 100 - premium)
-
-# Plot cumulative P/L
-plt.figure(figsize=(10, 5))
-plt.title("Trading This Edge Over Time")
-plt.plot(np.cumsum(pls), label="Account Equity", color="cyan")
-plt.xlabel('Option Trades')
-plt.ylabel('Portfolio Value')
-plt.legend()
-plt.show()
+    plt.figure(figsize=(10, 5))
+    plt.title(f"Trading Edge Over Time — {best_type.upper()} ATM @ {expiry}")
+    plt.plot(np.cumsum(pls), label="Account Equity", color="cyan")
+    plt.xlabel('Option Trades')
+    plt.ylabel('Portfolio Value')
+    plt.legend()
+    plt.show()
+else:
+    print("\nNo valid market ask price for Monte Carlo P/L (best side). Skipping MC plot.")
 
 
